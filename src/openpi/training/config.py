@@ -6,7 +6,12 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol
+
+try:
+    from typing import TypeAlias
+except ImportError:
+    TypeAlias = Any  # Fallback for Python < 3.10
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -31,6 +36,9 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,42 +116,43 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
-        match model_config.model_type:
-            case _model.ModelType.PI0:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                    ],
-                )
-            case _model.ModelType.PI0_FAST:
-                tokenizer_cls = (
-                    _tokenizer.FASTTokenizer
-                    if model_config.fast_model_tokenizer is None
-                    else model_config.fast_model_tokenizer
-                )
-                tokenizer_kwargs = (
-                    {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
-                )
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizeFASTInputs(
-                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
-                        ),
-                    ],
-                    outputs=[
-                        _transforms.ExtractFASTActions(
-                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
-                            action_horizon=model_config.action_horizon,
-                            action_dim=model_config.action_dim,
-                        )
-                    ],
-                )
+        if model_config.model_type == _model.ModelType.PI0:
+            return _transforms.Group(
+                inputs=[
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    ),
+                ],
+            )
+        elif model_config.model_type == _model.ModelType.PI0_FAST:
+            tokenizer_cls = (
+                _tokenizer.FASTTokenizer
+                if model_config.fast_model_tokenizer is None
+                else model_config.fast_model_tokenizer
+            )
+            tokenizer_kwargs = (
+                {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
+            )
+            return _transforms.Group(
+                inputs=[
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeFASTInputs(
+                        tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                    ),
+                ],
+                outputs=[
+                    _transforms.ExtractFASTActions(
+                        tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                        action_horizon=model_config.action_horizon,
+                        action_dim=model_config.action_dim,
+                    )
+                ],
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {model_config.model_type}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,6 +245,62 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     )
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalHDF5DataConfig(DataConfigFactory):
+    """Configuration for local HDF5 datasets."""
+    
+    # Path to the local dataset directory containing HDF5 files
+    local_data_dir: str = tyro.MISSING
+    # Default prompt to use if not present in data
+    default_prompt: str | None = None
+    # If true, will convert joint dimensions to deltas with respect to the current state
+    use_delta_joint_actions: bool = True
+    # If true, adapt to PI internal runtime space
+    adapt_to_pi: bool = True
+    # Set a default repo_id for local datasets
+    repo_id: str = "local_hdf5"
+
+    # Repack transforms for local dataset format
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"ee": "observation.images.ee"},
+                        "state": "observation.state",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset
+    action_sequence_keys: Sequence[str] = ("actions",)
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -742,6 +807,34 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+    #
+    # Custom peg-in-hole aerial config for local testing
+    #
+    TrainConfig(
+        name="pi0_peg_in_hole_aerial",
+        model=pi0.Pi0Config(
+            action_dim=8,
+            action_horizon=16,
+            max_token_len=180,
+        ),
+        data=FakeDataConfig(repo_id="fake"),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5_000,  # Reduced for testing
+        batch_size=4,  # Small batch size for local testing
+        log_interval=50,
+        save_interval=500,
+        keep_period=1_000,
+        num_workers=0,
+        wandb_enabled=False,  # Disable wandb for local testing
+        exp_name="peg_in_hole_aerial_test",
+        overwrite=True,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
